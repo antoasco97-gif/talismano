@@ -21,5 +21,5 @@ jobs:
           api_token: ${{ secrets.KOYEB_API_TOKEN }}
 
       - name: Riavvia il servizio su Koyeb
-        run: |
-          koyeb service redeploy \( {{ vars.dangerous-torrie }}/ \){{ vars.easyproxy }} --wait
+        run:    koyeb service redeploy \( {{ vars.KOYEB_APP_NAME }}/ \){{ vars.KOYEB_SERVICE_NAME }} --wait
+             
