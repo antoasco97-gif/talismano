@@ -1,9 +1,9 @@
 name: Riavvia servizio su Koyeb
 
 on:
-  workflow_dispatch:           # Per eseguire manualmente
-  schedule:
-    - cron: '0 4 * * *'        # Esempio: ogni giorno alle 4:00 UTC
+  workflow_dispatch:     # Esegui manualmente
+  # schedule:
+  #   - cron: '0 4 * * *'   # scommenta se vuoi riavvio automatico (es. ogni giorno alle 4 UTC)
 
 jobs:
   redeploy:
@@ -13,12 +13,16 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Installa Koyeb CLI
+      - name: Installa Koyeb CLI (necessario per l'action successiva)
         uses: koyeb-community/koyeb-actions@v2
         with:
           api_token: ${{ secrets.KOYEB_API_TOKEN }}
 
-      - name: Riavvia il servizio (redeploy)
-        run: |
-          echo "🔄 Redeploy in corso di \( {{ vars.KOYEB_APP_NAME }}/ \){{ vars.KOYEB_SERVICE_NAME }} ..."
-          koyeb redeploy \( {{ vars.KOYEB_APP_NAME }}/ \){{ vars.KOYEB_SERVICE_NAME }} --wait
+      - name: Riavvia / Redeploy servizio su Koyeb
+        uses: koyeb/action-git-deploy@v1
+        with:
+          app-name: ${{ vars.KOYEB_APP_NAME }}      # es. myapp
+          service-name: ${{ vars.KOYEB_SERVICE_NAME }}  # es. web oppure api
+          # Opzionali utili:
+          # deployment-strategy: rolling          # o blue-green se vuoi
+          # wait: true
