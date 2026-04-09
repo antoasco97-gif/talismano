@@ -1,0 +1,25 @@
+on:
+  # Opzioni di trigger (scegli quello che ti serve)
+  workflow_dispatch:          # Esegui manualmente dal tab "Actions"
+  schedule:
+    - cron: '0 4 * * *'       # Ogni giorno alle 4:00 UTC (esempio)
+  # Oppure su push/pull_request se vuoi riavviare dopo certi cambiamenti
+  # push:
+  #   branches: [ main ]
+
+jobs:
+  restart:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Installa e configura Koyeb CLI
+        uses: koyeb-community/koyeb-actions@v2
+        with:
+          api_token: ${{ secrets.KOYEB_API_TOKEN }}
+
+      - name: Riavvia il servizio su Koyeb
+        run: |
+          koyeb service redeploy \( {{ vars.dangerous-torrie }}/ \){{ vars.easyproxy }} --wait
