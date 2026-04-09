@@ -1,25 +1,24 @@
+name: Riavvia servizio su Koyeb
+
 on:
-  # Opzioni di trigger (scegli quello che ti serve)
-  workflow_dispatch:          # Esegui manualmente dal tab "Actions"
+  workflow_dispatch:           # Per eseguire manualmente
   schedule:
-    - cron: '0 4 * * *'       # Ogni giorno alle 4:00 UTC (esempio)
-  # Oppure su push/pull_request se vuoi riavviare dopo certi cambiamenti
-  # push:
-  #   branches: [ main ]
+    - cron: '0 4 * * *'        # Esempio: ogni giorno alle 4:00 UTC
 
 jobs:
-  restart:
+  redeploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Installa e configura Koyeb CLI
+      - name: Installa Koyeb CLI
         uses: koyeb-community/koyeb-actions@v2
         with:
           api_token: ${{ secrets.KOYEB_API_TOKEN }}
 
-      - name: Riavvia il servizio su Koyeb
-        run:    koyeb service redeploy \( {{ vars.KOYEB_APP_NAME }}/ \){{ vars.KOYEB_SERVICE_NAME }} --wait
-             
+      - name: Riavvia il servizio (redeploy)
+        run: |
+          echo "🔄 Redeploy in corso di \( {{ vars.KOYEB_APP_NAME }}/ \){{ vars.KOYEB_SERVICE_NAME }} ..."
+          koyeb redeploy \( {{ vars.KOYEB_APP_NAME }}/ \){{ vars.KOYEB_SERVICE_NAME }} --wait
