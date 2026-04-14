@@ -1448,6 +1448,10 @@ class HLSProxy:
         except Exception as e:
             # ✅ MIGLIORATO: Distingui tra errori temporanei (sito offline) ed errori critici
             error_msg = str(e).lower()
+            is_expired_embed = (
+                "expired vixsrc embed url" in error_msg
+                or ("vixsrc" in error_msg and "expired" in error_msg and "embed" in error_msg)
+            )
             is_temporary_error = any(
                 x in error_msg
                 for x in [
@@ -1464,6 +1468,12 @@ class HLSProxy:
             extractor_name = "unknown"
             if VavooExtractor and isinstance(extractor, VavooExtractor):
                 extractor_name = "VavooExtractor"
+            elif extractor is not None:
+                extractor_name = type(extractor).__name__
+
+            if is_expired_embed:
+                logger.info("Expired VixSrc embed URL rejected: %s", str(e))
+                return web.Response(text=str(e), status=410)
 
             # Se è un errore temporaneo (sito offline), logga solo un WARNING senza traceback
             if is_temporary_error:
