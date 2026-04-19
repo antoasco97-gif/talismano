@@ -11,7 +11,7 @@ services:
     ports:
       - '${PORT:-7860}:${PORT:-7860}'
     environment:
-      - API_PASSWORD=ep
+      - API_PASSWORD=Abrakadabraalakazam9497
       - PORT=7860
       - FLARESOLVERR_TIMEOUT=30
       - ENABLE_WARP=true            # Imposta a true per attivare WARP integrato
