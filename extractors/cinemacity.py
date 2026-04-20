@@ -10,7 +10,8 @@ from typing import Any, Dict, Optional
 import aiohttp
 from aiohttp import ClientSession, ClientTimeout, TCPConnector
 from aiohttp_socks import ProxyConnector
-from config import FLARESOLVERR_URL, FLARESOLVERR_TIMEOUT
+from config import FLARESOLVERR_URL, FLARESOLVERR_TIMEOUT, get_proxy_for_url, TRANSPORT_ROUTES, GLOBAL_PROXIES, get_connector_for_proxy
+from utils.smart_request import smart_request
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +24,7 @@ class CinemaCityExtractor:
 
     def __init__(self, request_headers: dict, proxies: list = None):
         self.request_headers = request_headers
-        self.proxies = proxies or []
+        self.proxies = proxies or GLOBAL_PROXIES
         self.session = None
         self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
         self.base_url = "https://cinemacity.cc"
@@ -36,8 +37,8 @@ class CinemaCityExtractor:
     async def _get_session(self):
         if self.session is None or self.session.closed:
             timeout = ClientTimeout(total=60, connect=30, sock_read=30)
-            proxy = self._get_random_proxy()
-            connector = ProxyConnector.from_url(proxy) if proxy else TCPConnector(limit=0, use_dns_cache=True)
+            proxy = get_proxy_for_url(self.base_url, TRANSPORT_ROUTES, self.proxies)
+            connector = get_connector_for_proxy(proxy) if proxy else TCPConnector(limit=0, use_dns_cache=True)
             self.session = ClientSession(timeout=timeout, connector=connector, headers={'User-Agent': self.user_agent})
         return self.session
 
@@ -51,7 +52,15 @@ class CinemaCityExtractor:
             "cmd": cmd,
             "maxTimeout": (self.flaresolverr_timeout + 60) * 1000,
         }
-        if url: payload["url"] = url
+        if url: 
+            payload["url"] = url
+            # Determina dinamicamente il proxy per questo specifico URL
+            proxy = get_proxy_for_url(url, TRANSPORT_ROUTES, self.proxies)
+            if proxy:
+                # FlareSolverr richiede il proxy nel formato {"url": "..."}
+                payload["proxy"] = {"url": proxy}
+                logger.debug(f"CinemaCity: Passing proxy to FlareSolverr: {proxy}")
+
         if post_data: payload["postData"] = post_data
 
         async with aiohttp.ClientSession() as session:
@@ -132,6 +141,12 @@ class CinemaCityExtractor:
                 idx = max(0, int(episode) - 1)
                 ep_data = selected_season[idx] if idx < len(selected_season) else selected_season[0]
                 selected_ep = ep_data.get('file')
+            
+            if selected_ep:
+                logger.info(f"CinemaCity: Selected S{season}E{episode} -> {selected_ep[:50]}...")
+            else:
+                logger.warning(f"CinemaCity: Failed to find S{season}E{episode} in file_data")
+            
             return selected_ep
         return None
 
@@ -141,8 +156,15 @@ class CinemaCityExtractor:
         
         # Get params from kwargs or URL query
         media_type = kwargs.get('type', 'movie')
-        season = int(kwargs.get('s', kwargs.get('season', 1)))
-        episode = int(kwargs.get('e', kwargs.get('episode', 1)))
+        
+        # Try to extract s/e from URL if not in kwargs
+        url_params = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        
+        s_val = kwargs.get('s') or kwargs.get('season') or url_params.get('s', [None])[0] or url_params.get('season', ['1'])[0]
+        e_val = kwargs.get('e') or kwargs.get('episode') or url_params.get('e', [None])[0] or url_params.get('episode', ['1'])[0]
+        
+        season = int(s_val) if str(s_val).isdigit() else 1
+        episode = int(e_val) if str(e_val).isdigit() else 1
 
         headers = {
             "User-Agent": self.user_agent,
@@ -150,28 +172,11 @@ class CinemaCityExtractor:
             "Referer": f"{self.base_url}/"
         }
 
-        async with session.get(url, headers=headers) as response:
-            if response.status != 200:
-                logger.warning(f"CinemaCity: Direct access failed with HTTP {response.status}, trying FlareSolverr...")
-                html = ""
-            else:
-                html = await response.text()
-
-        # Fallback to FlareSolverr if direct access fails or returns block page
-        if not html or "cf-challenge" in html or "ray id" in html.lower():
-            if self.flaresolverr_url:
-                try:
-                    logger.info(f"CinemaCity: Using FlareSolverr for {url}")
-                    res = await self._request_flaresolverr("request.get", url)
-                    html = res.get("solution", {}).get("response", "")
-                    # Update user agent if returned by FlareSolverr
-                    sol_ua = res.get("solution", {}).get("userAgent")
-                    if sol_ua: self.user_agent = sol_ua
-                except Exception as e:
-                    logger.error(f"CinemaCity: FlareSolverr bypass failed: {e}")
+        # Usiamo smart_request che gestisce tutto (diretto, proxy e FlareSolverr fallback)
+        html = await smart_request("request.get", url, headers=headers, proxies=self.proxies)
             
         if not html:
-            raise ExtractorError("Failed to retrieve page content (Direct & FlareSolverr failed)")
+            raise ExtractorError("Failed to retrieve page content (SmartRequest failed)")
 
         # Find player for referer
         iframe_match = re.search(r'<iframe[^>]+src=["\']([^"\']*player\.php[^"\']*)["\']', html, re.I)

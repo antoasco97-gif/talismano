@@ -6,7 +6,8 @@ import aiohttp
 from aiohttp import ClientSession, ClientTimeout, TCPConnector
 from aiohttp_socks import ProxyConnector
 
-from config import FLARESOLVERR_URL, FLARESOLVERR_TIMEOUT
+from config import FLARESOLVERR_URL, FLARESOLVERR_TIMEOUT, get_proxy_for_url, TRANSPORT_ROUTES, GLOBAL_PROXIES, get_connector_for_proxy
+from utils.smart_request import smart_request
 
 logger = logging.getLogger(__name__)
 
@@ -28,53 +29,17 @@ class FreeshotExtractor:
             "Referer": "https://thisnot.business/",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         }
-        self.proxies = proxies or []
+        self.proxies = proxies or GLOBAL_PROXIES
         self.session = None
         self.flaresolverr_url = FLARESOLVERR_URL
         self.flaresolverr_timeout = FLARESOLVERR_TIMEOUT
 
-    async def _request_flaresolverr(self, cmd: str, url: str = None, post_data: str = None, session_id: str = None) -> dict:
-        """Performs a request via FlareSolverr."""
-        if not self.flaresolverr_url:
-            raise ExtractorError("FlareSolverr URL not configured")
 
-        endpoint = f"{self.flaresolverr_url.rstrip('/')}/v1"
-        payload = {
-            "cmd": cmd,
-            "maxTimeout": (self.flaresolverr_timeout + 60) * 1000,
-        }
-        if url: payload["url"] = url
-        if post_data: payload["postData"] = post_data
-        if session_id: payload["session"] = session_id
-
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.post(
-                    endpoint,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=self.flaresolverr_timeout + 95),
-                ) as resp:
-                    if resp.status != 200:
-                        raise ExtractorError(f"FlareSolverr HTTP {resp.status}")
-                    data = await resp.json()
-            except Exception as e:
-                logger.error(f"Freeshot: FlareSolverr request failed ({cmd}): {e}")
-                raise ExtractorError(f"FlareSolverr bypass failed: {e}")
-
-        if data.get("status") != "ok":
-            raise ExtractorError(f"FlareSolverr ({cmd}): {data.get('message', 'unknown error')}")
-        
-        return data
-
-    async def _get_session(self):
+    async def _get_session(self, url: str = None):
         if self.session is None or self.session.closed:
-            connector = TCPConnector(ssl=False)
-            # Se volessimo usare proxy per la richiesta iniziale (ma qui l'idea è usare l'IP del server MFP)
-            # if self.proxies:
-            #     proxy = self.proxies[0] # Simple logic
-            #     connector = ProxyConnector.from_url(proxy)
-            
-            timeout = ClientTimeout(total=30)  # Increased timeout
+            proxy = get_proxy_for_url(url, TRANSPORT_ROUTES, self.proxies) if url else None
+            connector = get_connector_for_proxy(proxy, ssl=False) if proxy else TCPConnector(ssl=False, limit=0, use_dns_cache=True)
+            timeout = ClientTimeout(total=30)
             self.session = ClientSession(connector=connector, timeout=timeout)
         return self.session
 
@@ -105,13 +70,12 @@ class FreeshotExtractor:
                 if self.flaresolverr_url:
                     try:
                         logger.info(f"FreeshotExtractor: Uso FlareSolverr per estrarre codice da {url}")
-                        res = await self._request_flaresolverr("request.get", url)
-                        content = res.get("solution", {}).get("response", "")
+                        content = await smart_request("request.get", url, headers=self.base_headers, proxies=self.proxies)
                     except Exception as e:
                         logger.warning(f"FreeshotExtractor: FlareSolverr fallito per freeshot.live: {e}")
                 
                 if not content:
-                    session = await self._get_session()
+                    session = await self._get_session(url)
                     try:
                         async with session.get(url, headers=self.base_headers, timeout=15) as resp:
                             if resp.status == 200:
@@ -172,39 +136,12 @@ class FreeshotExtractor:
         body = ""
         ua = self.base_headers["User-Agent"]
         
-        session = await self._get_session()
+        session = await self._get_session(target_url)
         # Retry logic with exponential backoff for direct request
-        last_error = None
-        for attempt in range(self.MAX_RETRIES):
-            try:
-                # Usiamo allow_redirects=True per seguire eventuali redirect interni
-                async with session.get(target_url, headers=self.base_headers, allow_redirects=True) as resp:
-                    if resp.status != 200:
-                        raise ExtractorError(f"Freeshot request failed: HTTP {resp.status}")
-                    body = await resp.text()
-                    break  # Success, exit retry loop
-            except asyncio.TimeoutError:
-                last_error = f"Request timeout after 30s (attempt {attempt + 1}/{self.MAX_RETRIES})"
-                logger.warning(f"FreeshotExtractor: {last_error}")
-                if attempt < self.MAX_RETRIES - 1:
-                    await asyncio.sleep(self.RETRY_DELAYS[attempt])
-                continue
-            except asyncio.CancelledError:
-                last_error = f"Request cancelled (attempt {attempt + 1}/{self.MAX_RETRIES})"
-                logger.warning(f"FreeshotExtractor: {last_error}")
-                if attempt < self.MAX_RETRIES - 1:
-                    await asyncio.sleep(self.RETRY_DELAYS[attempt])
-                continue
-            except Exception as e:
-                last_error = str(e) if str(e) else type(e).__name__
-                logger.warning(f"FreeshotExtractor: Request error: {last_error} (attempt {attempt + 1}/{self.MAX_RETRIES})")
-                if attempt < self.MAX_RETRIES - 1:
-                    await asyncio.sleep(self.RETRY_DELAYS[attempt])
-                continue
-        else:
-            # All retries exhausted
-            if not body:
-                raise ExtractorError(f"Freeshot extraction failed after {self.MAX_RETRIES} attempts: {last_error}")
+        try:
+            body = await smart_request("request.get", target_url, headers=self.base_headers, proxies=self.proxies)
+        except Exception as e:
+            raise ExtractorError(f"Freeshot extraction failed for {target_url}: {e}")
         
         # Token extraction (no need for try-except wrapper since ExtractorError propagates)
         # Nuova estrazione token via currentToken

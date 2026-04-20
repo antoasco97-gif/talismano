@@ -114,6 +114,9 @@ docker run -d --name easyproxy --cap-add=NET_ADMIN --device /dev/net/tun -e ENAB
 > [!NOTE]
 > If you are deploying on **HuggingFace Spaces**, WARP cannot be used due to security restrictions. Set `ENABLE_WARP=false` in your environment variables.
 
+> [!TIP]
+> **Automatic Bypass (Vavoo):** Streams from Vavoo and other problematic providers automatically use the `&direct=1` flag to bypass WARP, ensuring they always use the VPS real IP for maximum stability.
+
 ---
 
 ## 📖 API Usage
@@ -129,6 +132,8 @@ http://localhost:7860/proxy/manifest.m3u8?url=<URL>
 **Options:**
 - `&clearkey=KID:KEY`: Provide keys for DASH streams.
 - `&h_<Header Name>=<Value>`: Pass custom headers (e.g., `&h_User-Agent=VLC`).
+- `&direct=1` (or `&warp=off`): Force a direct connection, bypassing WARP for this specific stream.  
+  *Example:* `http://localhost:7860/proxy/manifest.m3u8?url=http://example.com/video.m3u8&direct=1`
 
 ### 🔍 Stream Extractor
 Extract direct video links from supported websites.
