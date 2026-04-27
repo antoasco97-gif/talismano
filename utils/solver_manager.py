@@ -3,7 +3,7 @@ import asyncio
 import json
 import os
 import aiohttp
-from config import FLARESOLVERR_URL, FLARESOLVERR_TIMEOUT, FLARESOLVERR_WARM_SESSIONS
+from config import FLARESOLVERR_URL, FLARESOLVERR_TIMEOUT, FLARESOLVERR_WARM_SESSIONS, WARP_PROXY_URL
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,21 @@ class SolverSessionManager:
         except Exception as e:
             logger.warning(f"FlareSolverr: Errore salvataggio sessioni: {e}")
 
+    def _warm_session_key(self, proxy: str = None) -> str:
+        if not proxy:
+            return "universal"
+        return f"universal:{proxy}"
+
+    def _normalize_proxy(self, proxy: str | None) -> str | None:
+        if not proxy:
+            return None
+        return proxy.replace("socks5h://", "socks5://", 1)
+
+    def _is_warm_proxy_eligible(self, proxy: str = None) -> bool:
+        if proxy is None:
+            return True
+        return self._normalize_proxy(proxy) == self._normalize_proxy(WARP_PROXY_URL)
+
     async def get_session(self, proxy: str = None) -> tuple[str, bool]:
         """
         Ottiene una sessione FlareSolverr.
@@ -53,9 +68,10 @@ class SolverSessionManager:
             return None, False
 
         # Se non c'è proxy e la modalità Warm è attiva, usiamo la sessione persistente
-        if proxy is None and FLARESOLVERR_WARM_SESSIONS:
-            session_id = await self.get_persistent_session("universal", None)
-            if session_id: return session_id, True
+        if FLARESOLVERR_WARM_SESSIONS and self._is_warm_proxy_eligible(proxy):
+            session_id = await self.get_persistent_session(self._warm_session_key(proxy), proxy)
+            if session_id:
+                return session_id, True
         
         # Altrimenti creiamo una sessione temporanea (sarà distrutta dopo l'uso)
         session_id = await self._create_session(proxy)

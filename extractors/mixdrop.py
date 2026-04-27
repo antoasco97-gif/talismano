@@ -43,7 +43,7 @@ class MixdropExtractor:
             self.session = aiohttp.ClientSession(headers=self.base_headers)
         return self.session
 
-    async def _request_flaresolverr(self, cmd: str, url: str = None, post_data: str = None, session_id: str = None, wait: int = 0) -> dict:
+    async def _request_flaresolverr(self, cmd: str, url: str = None, post_data: str = None, session_id: str = None, wait: int = 0, headers: dict | None = None) -> dict:
         endpoint = f"{settings.flaresolverr_url.rstrip('/')}/v1"
         payload = {"cmd": cmd, "maxTimeout": (settings.flaresolverr_timeout + 60) * 1000}
         if wait > 0: payload["wait"] = wait
@@ -56,11 +56,75 @@ class MixdropExtractor:
                 fs_headers["X-Proxy-Server"] = get_solver_proxy_url(proxy)
         if post_data: payload["postData"] = post_data
         if session_id: payload["session"] = session_id
+        if headers: payload["headers"] = headers
         async with aiohttp.ClientSession() as fs_session:
             async with fs_session.post(endpoint, json=payload, headers=fs_headers, timeout=settings.flaresolverr_timeout + 95) as resp:
                 data = await resp.json()
         if data.get("status") != "ok": raise ExtractorError(f"FlareSolverr: {data.get('message')}")
         return data
+
+    def _step_headers(self, ua: str, referer: str | None = None) -> dict:
+        headers = {"User-Agent": ua}
+        if referer:
+            headers["Referer"] = referer
+        return headers
+
+    async def _light_fetch(
+        self,
+        session: aiohttp.ClientSession,
+        headers: dict,
+        cookies: dict,
+        session_id: str,
+        target_url: str,
+        post_data: dict | None = None,
+        referer: str | None = None,
+        force_flaresolverr: bool = False,
+    ) -> tuple[str | None, str]:
+        request_headers = dict(headers)
+        if referer:
+            request_headers["Referer"] = referer
+        if force_flaresolverr:
+            try:
+                fs_cmd = "request.post" if post_data else "request.get"
+                fs_res = await self._request_flaresolverr(fs_cmd, target_url, urlencode(post_data) if post_data else None, session_id=session_id, headers=request_headers)
+                sol = fs_res.get("solution", {})
+                cookies.update({c["name"]: c["value"] for c in sol.get("cookies", [])})
+                return sol.get("response", ""), sol.get("url", target_url)
+            except Exception:
+                return None, target_url
+        for _ in range(2):
+            try:
+                if post_data:
+                    async with session.post(target_url, data=post_data, cookies=cookies, headers=request_headers, timeout=12) as r:
+                        text = await r.text()
+                        if r.status != 200 or "cf-challenge" in text or "ray id" in text.lower() or "checking your browser" in text.lower():
+                            logger.info(f"Cloudflare or error ({r.status}) detected in redirect step (POST) for {target_url}, using FlareSolverr...")
+                            fs_res = await self._request_flaresolverr("request.post", target_url, urlencode(post_data), session_id=session_id, headers=request_headers)
+                            sol = fs_res.get("solution", {})
+                            cookies.update({c["name"]: c["value"] for c in sol.get("cookies", [])})
+                            return sol.get("response", ""), sol.get("url", target_url)
+                        return text, str(r.url)
+                else:
+                    async with session.get(target_url, cookies=cookies, headers=request_headers, timeout=12) as r:
+                        text = await r.text()
+                        if r.status != 200 or "cf-challenge" in text or "ray id" in text.lower() or "checking your browser" in text.lower():
+                            logger.info(f"Cloudflare or error ({r.status}) detected in redirect step (GET) for {target_url}, using FlareSolverr...")
+                            fs_res = await self._request_flaresolverr("request.get", target_url, session_id=session_id, headers=request_headers)
+                            sol = fs_res.get("solution", {})
+                            cookies.update({c["name"]: c["value"] for c in sol.get("cookies", [])})
+                            return sol.get("response", ""), sol.get("url", target_url)
+                        return text, str(r.url)
+            except Exception as e:
+                logger.debug(f"Light fetch failed: {e}, falling back to FlareSolverr...")
+                try:
+                    fs_cmd = "request.post" if post_data else "request.get"
+                    fs_res = await self._request_flaresolverr(fs_cmd, target_url, urlencode(post_data) if post_data else None, session_id=session_id, headers=request_headers)
+                    sol = fs_res.get("solution", {})
+                    cookies.update({c["name"]: c["value"] for c in sol.get("cookies", [])})
+                    return sol.get("response", ""), sol.get("url", target_url)
+                except Exception:
+                    return None, target_url
+        return None, target_url
 
     def _unpack(self, packed_js: str) -> str:
         try:
@@ -104,14 +168,18 @@ class MixdropExtractor:
 
         logger.info(f"🔍 [Cache Miss] Extracting new link for: {normalized_url}")
         proxy = get_proxy_for_url(normalized_url, TRANSPORT_ROUTES, self.proxies, self.bypass_warp_active)
-        # Use a persistent session specifically for the redirector flow
-        session_id = await solver_manager.get_persistent_session("deltabit", proxy)
+        is_redirector_url = any(d in normalized_url.lower() for d in ["safego.cc", "clicka.cc", "clicka"])
+        redirect_session_id = await solver_manager.get_persistent_session("redirector:clicka-safego", proxy) if is_redirector_url else None
+        final_session_id = await solver_manager.get_persistent_session("mixdrop", proxy)
+        session_id = redirect_session_id or final_session_id
         is_persistent = True
         try:
             # 1. Hybrid Solver for Redirectors
             ua, cookies = self.base_headers.get("User-Agent"), {}
-            if any(d in url.lower() for d in ["safego.cc", "clicka.cc", "clicka"]):
+            if is_redirector_url:
                 url, ua, cookies = await self._solve_redirector_hybrid(url, session_id)
+
+            session_id = final_session_id
 
             if "/f/" in url: url = url.replace("/f/", "/e/")
             if "/mix/" in url: url = url.replace("/mix/", "/e/")
@@ -128,21 +196,22 @@ class MixdropExtractor:
             
             for current_url in mirrors:
                 try:
+                    headers = self._step_headers(ua, current_url)
+                    session = await self._get_session()
                     for _ in range(2):
                         # Try aiohttp first (Fast Path)
                         html = ""
                         try:
-                            headers = {"User-Agent": ua, "Referer": current_url}
-                            session = await self._get_session()
                             async with session.get(current_url, cookies=cookies, headers=headers, timeout=5) as r:
                                 if r.status == 200: html = await r.text()
                         except Exception: pass
 
                         # Fallback to FlareSolverr if Fast Path fails
                         if not html or "Cloudflare" in html or "robot" in html.lower():
-                            res = await self._request_flaresolverr("request.get", current_url, session_id=session_id, wait=0)
+                            res = await self._request_flaresolverr("request.get", current_url, session_id=session_id, wait=0, headers=headers)
                             solution = res.get("solution", {})
                             html, ua = solution.get("response", ""), solution.get("userAgent", ua)
+                            headers["User-Agent"] = ua
                             cookies.update({c["name"]: c["value"] for c in solution.get("cookies", [])})
                         
                         # Handle internal Mixdrop captcha (robot checkbox)
@@ -154,7 +223,7 @@ class MixdropExtractor:
                             if form:
                                 post_fields = {inp.get("name"): inp.get("value", "") for inp in form.find_all("input") if inp.get("name")}
                                 if post_fields:
-                                    html, current_url = await light_fetch(current_url, post_data=post_fields)
+                                    html, current_url = await self._light_fetch(session, headers, cookies, session_id, current_url, post_data=post_fields, referer=current_url)
                                     if not html: break
                         
                         if "eval(function(p,a,c,k,e,d)" in html:
@@ -189,48 +258,19 @@ class MixdropExtractor:
 
             raise ExtractorError("Mixdrop: Video source not found")
         finally:
-            if session_id: await solver_manager.release_session(session_id, is_persistent)
+            if redirect_session_id:
+                await solver_manager.release_session(redirect_session_id, is_persistent)
+            if final_session_id and final_session_id != redirect_session_id:
+                await solver_manager.release_session(final_session_id, is_persistent)
 
     async def _solve_redirector_hybrid(self, url: str, session_id: str) -> tuple:
-        res = await self._request_flaresolverr("request.get", url, session_id=session_id)
+        res = await self._request_flaresolverr("request.get", url, session_id=session_id, headers=self._step_headers(self.base_headers.get("User-Agent"), url))
         solution = res.get("solution", {})
         ua, cookies = solution.get("userAgent"), {c["name"]: c["value"] for c in solution.get("cookies", [])}
         html, current_url = solution.get("response", ""), solution.get("url", url)
         
-        headers, session = {"User-Agent": ua, "Referer": url}, await self._get_session()
-        async def light_fetch(target_url, post_data=None):
-            for _ in range(2): # Retry once with FS if CF detected
-                try:
-                    if post_data:
-                        async with session.post(target_url, data=post_data, cookies=cookies, headers=headers, timeout=12) as r:
-                            text = await r.text()
-                            if "cf-challenge" in text or "ray id" in text.lower() or "checking your browser" in text.lower():
-                                logger.info(f"Cloudflare detected in redirect step for {target_url}, using FlareSolverr...")
-                                fs_res = await self._request_flaresolverr("request.post", target_url, urlencode(post_data), session_id=session_id)
-                                sol = fs_res.get("solution", {})
-                                cookies.update({c["name"]: c["value"] for c in sol.get("cookies", [])})
-                                return sol.get("response", ""), sol.get("url", target_url)
-                            return text, str(r.url)
-                    else:
-                        async with session.get(target_url, cookies=cookies, headers=headers, timeout=12) as r:
-                            text = await r.text()
-                            if "cf-challenge" in text or "ray id" in text.lower() or "checking your browser" in text.lower():
-                                logger.info(f"Cloudflare detected in redirect step for {target_url}, using FlareSolverr...")
-                                fs_res = await self._request_flaresolverr("request.get", target_url, session_id=session_id)
-                                sol = fs_res.get("solution", {})
-                                cookies.update({c["name"]: c["value"] for c in sol.get("cookies", [])})
-                                return sol.get("response", ""), sol.get("url", target_url)
-                            return text, str(r.url)
-                except Exception as e:
-                    logger.debug(f"Light fetch failed: {e}, falling back to FlareSolverr...")
-                    try:
-                        fs_cmd = "request.post" if post_data else "request.get"
-                        fs_res = await self._request_flaresolverr(fs_cmd, target_url, urlencode(post_data) if post_data else None, session_id=session_id)
-                        sol = fs_res.get("solution", {})
-                        cookies.update({c["name"]: c["value"] for c in sol.get("cookies", [])})
-                        return sol.get("response", ""), sol.get("url", target_url)
-                    except: return None, target_url
-            return None, target_url
+        headers, session = self._step_headers(ua, url), await self._get_session()
+        use_flaresolverr_only = True
 
         for step in range(8):
             if not any(d in current_url.lower() for d in ["safego.cc", "clicka.cc", "clicka", "uprot.net"]): break
@@ -251,7 +291,7 @@ class MixdropExtractor:
                     async with session.get(c_url, cookies=cookies, headers=headers) as r:
                         if r.status == 200: captcha_data = await r.read()
                         else:
-                            fs_res = await self._request_flaresolverr("request.get", c_url, session_id=session_id)
+                            fs_res = await self._request_flaresolverr("request.get", c_url, session_id=session_id, headers=self._step_headers(ua, current_url))
                             captcha_data = base64.b64decode(fs_res.get("solution", {}).get("response", "")) if "image" in fs_res.get("solution", {}).get("contentType", "") else None
 
                 if captcha_data:
@@ -266,9 +306,12 @@ class MixdropExtractor:
                     else: post_fields["code"] = captcha
                     
                     await asyncio.sleep(3.0) 
-                    html, current_url = await light_fetch(current_url, post_data=post_fields)
+                    html, current_url = await self._light_fetch(session, headers, cookies, session_id, current_url, post_data=post_fields, referer=current_url, force_flaresolverr=use_flaresolverr_only)
                     if not html: break
                     soup = BeautifulSoup(html, "lxml")
+                    headers["Referer"] = current_url
+                    if current_url and any(d in current_url.lower() for d in ["safego.cc", "clicka.cc", "clicka", "uprot.net"]):
+                        use_flaresolverr_only = True
                     logger.info(f"✅ Captcha submitted, current URL: {current_url}")
                     
                     if soup.find("img", src=re.compile(r'data:image/png;base64,|captcha\.php')):
@@ -308,22 +351,34 @@ class MixdropExtractor:
                                 logger.info(f"📝 Submitting form found via button: {txt}")
                                 post_url = urljoin(current_url, form.get("action", ""))
                                 post_data = {inp.get("name"): inp.get("value", "") for inp in form.find_all("input") if inp.get("name")}
-                                html, current_url = await light_fetch(post_url, post_data=post_data)
+                                html, current_url = await self._light_fetch(session, headers, cookies, session_id, post_url, post_data=post_data, referer=current_url, force_flaresolverr=use_flaresolverr_only)
                                 if html:
                                     soup = BeautifulSoup(html, "lxml")
+                                    headers["Referer"] = current_url
+                                    if current_url and any(d in current_url.lower() for d in ["safego.cc", "clicka.cc", "clicka", "uprot.net"]):
+                                        use_flaresolverr_only = True
                                     next_url = current_url
                                     break
                 
                 if next_url and next_url != current_url and "uprot.net" not in next_url:
+                    previous_url = current_url
                     current_url = next_url
-                    html, current_url = await light_fetch(current_url)
-                    if html: soup = BeautifulSoup(html, "lxml")
+                    html, current_url = await self._light_fetch(session, headers, cookies, session_id, current_url, referer=previous_url, force_flaresolverr=use_flaresolverr_only)
+                    if html:
+                        soup = BeautifulSoup(html, "lxml")
+                        headers["Referer"] = previous_url
+                        if current_url and any(d in current_url.lower() for d in ["safego.cc", "clicka.cc", "clicka", "uprot.net"]):
+                            use_flaresolverr_only = True
                     break
                 
                 if attempt < 6:
                     await asyncio.sleep(4.0)
-                    html, current_url = await light_fetch(current_url)
-                    if html: soup = BeautifulSoup(html, "lxml")
+                    html, current_url = await self._light_fetch(session, headers, cookies, session_id, current_url, referer=current_url, force_flaresolverr=use_flaresolverr_only)
+                    if html:
+                        soup = BeautifulSoup(html, "lxml")
+                        headers["Referer"] = current_url
+                        if current_url and any(d in current_url.lower() for d in ["safego.cc", "clicka.cc", "clicka", "uprot.net"]):
+                            use_flaresolverr_only = True
             
             if not next_url: break
         return current_url, ua, cookies
